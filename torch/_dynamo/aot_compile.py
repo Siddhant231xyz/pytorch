@@ -584,11 +584,16 @@ class AOTCompiledFunction:
         f_locals.update(bind_locals(self._artifacts.signature, *args, **kwargs))
         return f_locals
 
+    def _live_guard_manager(self) -> "GuardManagerWrapper":
+        # Narrowing for pyrefly, not a live check: __post_init__ always leaves a
+        # populated guard_manager (only serialize() nulls it, on a copy).
+        if self._artifacts.guard_manager is None:
+            raise AssertionError("live artifact must have a guard_manager")
+        return self._artifacts.guard_manager
+
     def guard_check(self, *args: Any, **kwargs: Any) -> bool:
         f_locals = self.prepare_f_locals(*args, **kwargs)
-        if self._artifacts.guard_manager is None:
-            raise AssertionError("guard_manager must not be None")
-        return self._artifacts.guard_manager.check(f_locals)
+        return self._live_guard_manager().check(f_locals)
 
     def __post_init__(self) -> None:
         from .package import load_guard_manager, load_guards_state
@@ -741,16 +746,22 @@ class AOTCompiledFunction:
         guard_scope.setdefault("__builtins__", builtins.__dict__)
         guard_scope[builtins_key] = get_builtins_dict(guard_scope)
 
-    def _missing_global_hint(self) -> str:
+    def _missing_global_hint(self, *, forward: str | None = None) -> str:
         """Advice for a guard that failed on a global its scope does not define,
-        worded for the scope the guards were actually resolved against."""
+        worded for the scope the guards were actually resolved against. Returns a
+        bare sentence; a caller that continues a line of its own adds the
+        separator. ``forward`` is the model class's ``forward``, passed only when
+        the guards hold the dict it resolves to, and honoured only in the
+        SUPPLIED branch."""
         if self._guard_scope is _GuardScope.RECONSTRUCTED:
+            rebuilt = (
+                "a guarded global is missing from the scope rebuilt from the artifact"
+            )
             if self._forward_not_resolved_reason is not None:
                 # A module load takes no f_globals=, which is the function load's
                 # parameter; _load_aot_compiled_module takes only the bytes.
                 return (
-                    " -- a guarded global is missing from the scope rebuilt from "
-                    "the artifact. That scope was rebuilt because get_traced_fn "
+                    f"{rebuilt}. That scope was rebuilt because get_traced_fn "
                     f"cannot resolve {self._forward_not_resolved_reason} to a "
                     "Python function; make model.forward a plain function or "
                     "bound method so its own globals are used instead, or pass "
@@ -758,34 +769,45 @@ class AOTCompiledFunction:
                     "carries the name."
                 )
             return (
-                " -- a guarded global is missing from the scope rebuilt from the "
-                "artifact; load with an f_globals= that is a complete live scope "
-                "carrying the name -- normally vars(mod) for the module mod that "
-                "defined the function, which is usually not the module doing the "
-                "loading -- so the guard can resolve it."
+                f"{rebuilt}; load with an f_globals= that is a complete live "
+                "scope carrying the name -- normally vars(mod) for the module "
+                "mod that defined the function, which is usually not the module "
+                "doing the loading -- so the guard can resolve it."
             )
         if self._guard_scope is _GuardScope.SUPPLIED:
+            where = (
+                # A module load resolves the scope from the INSTANCE attribute,
+                # so the dict is the globals of the function that attribute
+                # resolves to. Resolving forward on the class lands in that
+                # same dict whenever it reaches that same function, inheritance
+                # from another module included, and can land elsewhere once an
+                # instance rebinds forward; naming the class's forward alone
+                # would send that reader to a dict these guards never read.
+                f"the globals of the function {forward} resolves to -- or, for "
+                "an instance that rebound forward before the load, of the "
+                "function it was rebound to, since that is the one the load "
+                "resolved"
+                if forward is not None
+                else "the live scope this artifact was loaded against"
+            )
             return (
-                " -- a guarded global is missing from the live scope this "
-                "artifact was loaded against; define it there so the guard can "
-                "resolve it."
+                f"a guarded global is missing from {where}; define it there "
+                "so the guard can resolve it."
             )
         # CAPTURED: the guards hold the globals they were traced against BY
         # REFERENCE, so a name deleted after capture can be defined there again
         # to make the guard resolve -- the same advice as SUPPLIED, worded for
         # the dict this path actually used.
         return (
-            " -- a guarded global is missing from the globals of the module the "
+            "a guarded global is missing from the globals of the module the "
             "compiled function was traced in, which its guards still resolve "
             "against; define it there so the guard can resolve it."
         )
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        if self._artifacts.guard_manager is None:
-            raise AssertionError("guard_manager must not be None")
         if self._guard_check_enabled and not self.guard_check(*args, **kwargs):
             f_locals = self.prepare_f_locals(*args, **kwargs)
-            debug_info = self._artifacts.guard_manager.check_verbose(f_locals)
+            debug_info = self._live_guard_manager().check_verbose(f_locals)
             msg = f"GuardManager check failed, reason: {debug_info}"
             if any(
                 _names_a_missing_global(part) for part in debug_info.verbose_code_parts
@@ -794,7 +816,7 @@ class AOTCompiledFunction:
                 # ends in a newline, so the hint has to be appended to the
                 # stripped message: otherwise its inline continuation lands on a
                 # line of its own, starting with a stray space.
-                msg = msg.rstrip() + self._missing_global_hint()
+                msg = msg.rstrip() + " -- " + self._missing_global_hint()
             raise RuntimeError(msg)
         return self.fn(*args, **kwargs)
 
@@ -1324,13 +1346,121 @@ class AOTCompiledModel:
     # compiled_results is serializable. We require the model to deserialize again.
     model: torch.nn.Module
     compiled_results: list[AOTCompiledFunction]
+    # Whether one bind of a call serves every result: every result carries an
+    # equal signature and the same closure cells, as every artifact
+    # aot_compile_module produces does. Decided once here rather than per call
+    # because comparing two equal Signatures costs about what a bind does.
+    _shared_binding: bool = dataclasses.field(init=False, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._shared_binding = True
+        if not self.compiled_results:
+            return
+        first = self.compiled_results[0]._artifacts
+        cells = first.runtime_env.closure or ()
+        for result in self.compiled_results[1:]:
+            artifacts = result._artifacts
+            other = artifacts.runtime_env.closure or ()
+            if (
+                artifacts.signature != first.signature
+                or len(other) != len(cells)
+                or any(a is not b for a, b in zip(cells, other))
+            ):
+                self._shared_binding = False
+                return
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # A bind costs more than a check(), so bind once per call where the
+        # results share a binding, once per result where they do not, and reuse
+        # it below.
+        bound: list[dict[str, object]] = []
+        # Guard evaluation ignores _guard_check_enabled, so scan EVERY result for
+        # a real match first: a match among the opted-out results is served in
+        # index order like any other, not only after every other tree was checked
+        # twice below.
+        for i, result in enumerate(self.compiled_results):
+            # The bind stays ahead of every guard, so a call the signature cannot
+            # bind surfaces as bind_locals' TypeError, as the plain module call
+            # would -- a caller error no ModelInput could fix, rather than a
+            # no-match report.
+            if i and self._shared_binding:
+                f_locals = bound[0]
+            else:
+                f_locals = result.prepare_f_locals(self.model, *args, **kwargs)
+            bound.append(f_locals)
+            if result._live_guard_manager().check(f_locals):
+                # The guards already passed; call fn directly so result() does
+                # not re-run the guard eval on this hot dispatch path.
+                return result.fn(self.model, *args, **kwargs)
+        # check() can reject from the recursive dict-tag fast path without ever
+        # running the tree, so a rejection above is not yet an answer about this
+        # call -- but _disable_dict_tag_matching is then set on the node that
+        # rejected and on its ancestors, which nothing resets, so a second
+        # check() re-evaluates those in full. Opted-out results are re-checked
+        # too, for the scan's reason: the last resort serves the FIRST opted-out
+        # result whatever its guards say, so skipping a false-rejected one here
+        # would serve another result's graph in its place.
+        for i, result in enumerate(self.compiled_results):
+            if result._live_guard_manager().check(bound[i]):
+                return result.fn(self.model, *args, **kwargs)
+        # A result that opted out via disable_guard_check() accepts anything, but
+        # only after both passes above have failed to find a real match.
         for result in self.compiled_results:
-            if result.guard_check(self.model, *args, **kwargs):
-                return result(self.model, *args, **kwargs)
-        # All guards failed, just run one of them and throw the guard check error.
-        return self.compiled_results[0](self.model, *args, **kwargs)
+            if not result._guard_check_enabled:
+                return result.fn(self.model, *args, **kwargs)
+        raise RuntimeError(self._no_match_report(bound))
+
+    def _no_match_report(self, bound: list[dict[str, object]]) -> str:
+        """A report naming every compiled input and what its guards said.
+
+        ``bound`` is the f_locals the dispatch above judged, one per result, so
+        the report explains the same binding rather than a fresh one."""
+        lines = [
+            "No AOT compiled graph matched this call. Tried "
+            f"{len(self.compiled_results)} compiled input(s):"
+        ]
+        missing_global: AOTCompiledFunction | None = None
+        for i, result in enumerate(self.compiled_results):
+            reason = result._live_guard_manager().check_verbose(bound[i])
+            if reason.result:
+                # Quoting the guards it just passed would name the wrong thing.
+                lines.append(
+                    f"  [{i}] <guards rejected this call twice and then accepted "
+                    "it here: a guard that does not answer consistently, or a "
+                    "tag-safe fast path that refused without running the tree>"
+                )
+                continue
+            if not reason.verbose_code_parts:
+                # A failing accessor can report no parts at all (a set index past
+                # the end of a shorter set answers GuardDebugInfo(false, 0)), so
+                # an empty list is not the passing signal reason.result is.
+                lines.append(f"  [{i}] <guard check failed without naming a guard>")
+                continue
+            parts = reason.verbose_code_parts
+            if missing_global is None and any(map(_names_a_missing_global, parts)):
+                missing_global = result
+            # A part embeds the guard's raw source line, which linecache ends
+            # only at \n: collapse every separator splitlines() reads it back on.
+            joined = " ".join("; ".join(parts).splitlines())
+            lines.append(f"  [{i}] {joined}")
+        # Both advice lines below can apply: an entry that named a missing global
+        # says nothing about a call no input covers.
+        if missing_global is not None:
+            forward: str | None = f"{type(self.model).__name__}.forward"
+            # deserialize resolves the scope from model.forward only when the
+            # caller passed no guard_globals=, so that forward names the dict
+            # the guards hold only while it still resolves to it.
+            resolved, _ = _resolve_guard_scope(self.model)
+            if resolved is None or resolved is not missing_global._guard_globals:
+                forward = None
+            lines.append(missing_global._missing_global_hint(forward=forward))
+        lines.append(
+            "Add a ModelInput covering this call, or check whether "
+            "guard_filter_fn kept a guard this call cannot satisfy -- both "
+            "belong to the process that compiles the artifacts, which need not "
+            "be the one that loaded them."
+        )
+        return "\n".join(lines)
 
     def serialize(self) -> bytes:
         # Nothing threads external_data down this path (_save_aot_compiled_module
